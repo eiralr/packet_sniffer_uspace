@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <netdb.h>
 #include <net/if.h>
+#include <sys/un.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
@@ -25,12 +26,39 @@ struct ipv4_header * data_ipv4;
 struct tcp_header * data_tcp;
 struct in_addr ip_source_struct;
 struct in_addr ip_dest_struct;
+pthread_t capt_thread;
 
-static struct ip_stats *hash_table[256];
+static struct ip_stats hash_table[256];
 
-/*struct ip_stats */ void ip_search (int num) {
-	printf("IP ADDRESS: %s\n", inet_ntoa(hash_table[num]->ip_addr));
-	printf("PACKET NUMS %lu\n", hash_table[num]->num);
+
+void string_parsing (char * buff, int ev_sock, int sock) {
+		char iface[10];
+		if (!strcmp("start", buff)) {
+			start_capture(sock, NULL);
+		} else if (!strcmp("stop", buff)) {
+			deinit_capture(sock);
+		} else if (strstr(buff, "select iface") != NULL) {
+			char iface[10];
+			strcpy(iface, buff + strlen("select iface "));
+			iface[strlen(iface)] = '\0';
+			start_capture(sock, iface);
+		} else if ((strstr(buff, "show") != NULL) && (strstr(buff, "count")) != NULL) {
+			char ip[4];
+			if (sscanf (buff, "show %s", ip) != 0) {
+				struct in_addr inp;
+				if(inet_aton(ip, &inp) == 0) {
+					printf ("Wrong ip address format!");
+				} else {
+					int num = 0;
+					num = IP_HASH(inp.s_addr);
+					printf("%d\n", num);
+					write(ev_sock, &hash_table[num], sizeof(struct ip_stats));
+				}
+			}
+		}
+ 
+		memset(buff, 0, sizeof(buff));
+
 }
 
 
@@ -48,6 +76,161 @@ int deinit_capture(int sock) {
 	close(sock);
 	return 0;
 }
+
+int init_conn () {
+
+	int ev_sock = -1;
+
+	struct sockaddr_un ev_sock_struct;
+
+	ev_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (ev_sock < 0) {
+		printf ("ERROR!\n");
+		return 1;
+	}
+
+	ev_sock_struct.sun_family = AF_UNIX;
+	strcpy(ev_sock_struct.sun_path, "ev_sock_file");
+
+	unlink("ev_sock_file");
+
+	if (bind(ev_sock, (struct sockaddr *) &ev_sock_struct, sizeof(ev_sock_struct)) < 0) {
+		printf ("ERROR! Error binding socket! \n");
+		close(ev_sock);
+		return 1;
+	}
+	return ev_sock;
+}
+
+void * main_sniffer_func(void * param) {
+
+	struct thread_data * thread_struct = (struct thread_data *) param; 
+	int sock = -1;
+	int i = 0;
+	char *buff = NULL;
+	ssize_t rec = 0;
+
+	sock = thread_struct->sock;
+
+	struct types_array table_of_types_ipl [] = {
+		{6, "TCP"},
+		{17, "UDP"},
+		{40, "IL Protocol"},
+		{47, "Generic Routing Encapsulation"},
+		{50, "Encapsulating Security Payload"},
+		{51, "Authentication Header"},
+		{132, "Stream Control Transmission Protocol"},
+	}; 
+
+	buff = (char *) malloc (ETH_FRAME_LEN);
+	if (!buff) {
+		printf("Failed to allocate memory!\n");
+		exit(1);
+	}
+
+	while (capture_started) {
+
+		int numb = 0;
+	
+		rec = recvfrom (sock, buff, ETH_FRAME_LEN, 0, NULL, 0);
+		if (rec == -1)
+			exit(1);
+
+		data_packet = (struct ether_header *) buff;
+
+		printf ("Packet size: %ld \n", rec);
+
+		mac_level_output(data_packet);
+
+		if (ntohs(data_packet->eth_type) == 0x0800) {
+
+			data_ipv4 = (struct ipv4_header *) &buff[sizeof(struct ether_header)];
+
+			numb = IP_HASH(ip_source_struct.s_addr);
+			printf ("NUM: %d\n", numb);
+			hash_table[numb].ip_addr = ip_source_struct;
+			hash_table[numb].num++;
+			int i = 0;
+			for (i = 0; i < 256; i++) {
+				if ((hash_table[i].num) > 0) {
+					printf("IP ADDRESS: %s\n", inet_ntoa(hash_table[i].ip_addr));
+					printf("PACKET NUMS %lu\n", hash_table[i].num);
+				}
+			}
+
+			ip_level_output(data_ipv4);
+		} 
+
+		printf ("\n \n");
+	}
+
+	free (buff); 
+	exit(0);
+}
+
+
+int ret_index_by_name (char * device_name, struct ifreq iface, int sock) {
+
+		strncpy((char *)iface.ifr_name, device_name, IFNAMSIZ);
+		if ((ioctl(sock, SIOCGIFINDEX, &iface)) == -1) {
+			printf("Error getting Interface index !\n");
+			return -1;
+		}
+
+		printf ("%d\n\n", iface.ifr_ifindex);
+		return iface.ifr_ifindex;	
+}
+
+
+int start_capture(int sock, const char *ifname) {
+
+	struct ifreq iface;
+	struct ifaddrs *iface_list;
+	struct ifaddrs *ifc;
+	struct sockaddr_ll sll;
+
+
+	if (getifaddrs(&iface_list) == -1) {
+		perror("getifaddrs");
+		exit(EXIT_FAILURE);
+	}
+
+
+	for (ifc = iface_list; (ifc->ifa_next) != NULL; ifc = ifc->ifa_next) {
+		if (ifc->ifa_addr->sa_family == PF_PACKET) { 
+			if (ifc->ifa_flags & IFF_UP) {  
+				if (ifname) {
+					if(!strcmp(ifc->ifa_name, ifname)) {
+						printf("Capture started on iface %-8s \n", ifc->ifa_name); 
+						sll.sll_ifindex = ret_index_by_name(ifc->ifa_name, iface, sock);
+						break;
+					} else
+						continue;
+				} else {
+					sll.sll_ifindex = ret_index_by_name(ifc->ifa_name, iface, sock);
+					printf("Default iface selected: %-8s \n", ifc->ifa_name);
+					break;
+				} 			
+			}
+		}
+	}
+
+	sll.sll_family = AF_PACKET;
+	sll.sll_protocol = htons(ETH_P_ALL);
+
+	if (bind(sock, (struct sockaddr *) &sll, sizeof (sll)) == -1) {
+		printf ("ERROR! %s\n", strerror(errno));
+		return 1;
+	}
+
+	capture_started = 1;
+
+	if (pthread_create(&capt_thread, NULL, (void *) (&main_sniffer_func), &sock) != 0) {
+		printf ("ERROR! Can't create thread! \n");
+	}
+}
+
+
 
 void mac_level_output (struct ether_header * data_packet) {
 		int i = 0;
@@ -105,7 +288,7 @@ void ip_level_output (struct ipv4_header * data_ipv4) {
 		}
 	}
 
-//	ip_source_struct.s_addr = data_ipv4->ip_source;
+	ip_source_struct.s_addr = data_ipv4->ip_source;
 	ip_dest_struct.s_addr = data_ipv4->ip_dest;
 
 
@@ -113,152 +296,4 @@ void ip_level_output (struct ipv4_header * data_ipv4) {
 	printf ("Source IP address: %s \n", inet_ntoa (ip_source_struct));
 	printf ("Destination IP address: %s \n", inet_ntoa(ip_dest_struct));
 	printf ("Options: %x \n", IPV4_OPTIONS ((data_ipv4->version_header_size & 0xF), ntohl(data_ipv4->options)));
-}
-
-void tcp_level_output (struct tcp_header * data_tcp) {
-
-	printf ("Source port: %hu \n", ntohs (data_tcp->source_port));
-	printf ("Destination port: %hu \n", ntohs (data_tcp->dest_port));
-
-	if (data_ipv4->protocol == 6) {
-
-		printf ("Sequence number: %u \n", ntohl (data_tcp->seq_num));
-		printf ("Acknoulegement number: %u \n", ntohl (data_tcp->ack_num));
-		printf ("Data offset: %hhu \n", (data_tcp->data_offset_reserved >> 4));
-		printf ("Reserved: %hhu \n", data_tcp->data_offset_reserved & 0xF);
-		printf ("TCP layer flags: %u \n", data_tcp->tcp_flags);
-		printf ("Window size: %u \n", ntohs(data_tcp->win_size));
-		printf ("Checksum: %hu \n", ntohs (data_tcp->checksum));
-		printf ("Urgent pointer: %hu \n", ntohs(data_tcp->urg_pointer));
-		printf ("Options: %u \n", ntohs(data_tcp->options));
-	}
-
-}
-
-int main_sniffer_func(int sock) {
-
-	int i = 0;
-	char *buff = NULL;
-	ssize_t rec = 0;
-
-	struct types_array table_of_types_ipl [] = {
-		{6, "TCP"},
-		{17, "UDP"},
-		{40, "IL Protocol"},
-		{47, "Generic Routing Encapsulation"},
-		{50, "Encapsulating Security Payload"},
-		{51, "Authentication Header"},
-		{132, "Stream Control Transmission Protocol"},
-	}; 
-
-	buff = (char *) malloc (ETH_FRAME_LEN);
-	if (!buff) {
-		printf("Failed to allocate memory!\n");
-		return 1;
-	}
-
-	while (capture_started) {
-
-		int num = 0;
-	
-		rec = recvfrom (sock, buff, ETH_FRAME_LEN, 0, NULL, 0);
-		if (rec == -1)
-			return 1;
-
-		data_packet = (struct ether_header *) buff;
-
-		printf ("Packet size: %ld \n", rec);
-
-		mac_level_output(data_packet);
-
-		if (ntohs(data_packet->eth_type) == 0x0800) {
-
-			data_ipv4 = (struct ipv4_header *) &buff[sizeof(struct ether_header)];
-
-			num = IP_HASH(data_ipv4->ip_source);
-			ip_source_struct.s_addr = data_ipv4->ip_source;
-			hash_table[num]->ip_addr = ip_source_struct;
-			hash_table[num]->num++;
-
-			ip_level_output(data_ipv4);
-		} 
-
-		printf ("\n \n");
-	}
-
-	free (buff); 
-
-	return 0;
-}
-
-
-int ret_index_by_name (char * device_name, struct ifreq iface, int sock) {
-
-		strncpy((char *)iface.ifr_name, device_name, IFNAMSIZ);
-		if ((ioctl(sock, SIOCGIFINDEX, &iface)) == -1) {
-			printf("Error getting Interface index !\n");
-			return -1;
-		}
-
-		printf ("%d\n\n", iface.ifr_ifindex);
-		return iface.ifr_ifindex;	
-}
-
-
-int start_capture(int sock, const char *ifname) {
-
-	struct ifreq iface;
-	struct ifaddrs *iface_list;
-	struct ifaddrs *ifc;
-	struct sockaddr_ll sll;
-	pthread_t capt_thread;
-
-	if (getifaddrs(&iface_list) == -1) {
-		perror("getifaddrs");
-		exit(EXIT_FAILURE);
-	}
-
-
-	for (ifc = iface_list; (ifc->ifa_next) != NULL; ifc = ifc->ifa_next) {
-		if (ifc->ifa_addr->sa_family == PF_PACKET) { 
-			if (ifc->ifa_flags & IFF_UP) {  
-				if (!ifname) {
-					sll.sll_ifindex = ret_index_by_name(ifc->ifa_name, iface, sock);
-					printf("Default iface selected: %-8s \n", ifc->ifa_name); 
-				} else {
-					if(!strcmp(ifc->ifa_name, ifname)) {
-						printf("Capture started on iface %-8s \n", ifc->ifa_name); 
-						sll.sll_ifindex = ret_index_by_name(ifc->ifa_name, iface, sock);
-						break;
-					} else
-						continue;
-				}
-			}
-		}
-	}
-
-
-
-	sll.sll_family = AF_PACKET;
-	sll.sll_protocol = htons(ETH_P_ALL);
-
-	if (bind(sock, (struct sockaddr *) &sll, sizeof (sll)) == -1) {
-		printf ("ERROR! %s\n", strerror(errno));
-		return 1;
-	}
-
-	capture_started = 1;
-
-	if (pthread_create(&capt_thread, NULL, (void *) (&main_sniffer_func), NULL) != 0) {
-		printf ("ERROR! Can't create thread! \n");
-	}
-		
-	main_sniffer_func(sock);
-}
-
-/* mktemp	 */
-
-int stop_capture(int sock) {
-	capture_started = 0;
-	/* thread stop */
 }

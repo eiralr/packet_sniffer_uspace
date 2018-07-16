@@ -22,39 +22,32 @@ struct ipv4_header {
 	unsigned int options;
 }__attribute__((__packed__)); 
 
-struct tcp_header {
-	unsigned short source_port; 
-	unsigned short dest_port;
-	unsigned int seq_num;
-	unsigned int ack_num;
-	unsigned char data_offset_reserved;			/* 4 bits for data offset, 4 bits reserved */
-	unsigned char tcp_flags;					/* CWR, ECE, URG, ACK, PSH, RST, SYN, FIN */
-	unsigned short win_size;
-	unsigned short checksum;
-	unsigned short urg_pointer;
-	unsigned int options; 
-}__attribute__((__packed__)); 
 
 struct types_array {
 	unsigned short type;
 	char * string;
 };
 
+struct thread_data {
+	int sock;
+};
+
 struct ip_stats {
 	struct in_addr ip_addr;
 	uint64_t num;
-	struct ip_stats *next;
+//	struct ip_stats *next;
 };
 
 int f_usage (char* program_name); 
 void mac_level_output (struct ether_header * data_packet);
 void ip_level_output (struct ipv4_header * data_ipv4);
-void tcp_level_output (struct tcp_header * data_tcp);
 int start_capture(int sock, const char *ifname); 
 int init_capture();
 int deinit_capture(int sock);
+int init_conn (); 
 int stop_capture(int sock); 
 void print_ip_stats (struct ip_stats stats); 
 struct ip_stats stats_data (struct ip_stats stats, struct in_addr ip_source_struct);
-int main_sniffer_func (int sock);
-int ret_index_by_name (char * device_name, struct ifreq iface, int sock); 
+void * main_sniffer_func (void * param);
+int ret_index_by_name (char * device_name, struct ifreq iface, int sock);
+void string_parsing (char * buff, int ev_sock, int sock); 
